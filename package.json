@@ -1,7 +1,7 @@
 {
-  "name": "lobehub-kie-z-image-mcp",
+  "name": "lobehub-kie-image-mcp",
   "version": "1.0.0",
-  "description": "A Docker-ready Streamable HTTP MCP server for KIE Z-Image in LobeHub.",
+  "description": "A Docker-ready Streamable HTTP MCP server for KIE image models in LobeHub.",
   "type": "module",
   "scripts": {
     "start": "node src/server.js",

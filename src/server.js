@@ -2,14 +2,37 @@ import http from 'node:http';
 import { URL } from 'node:url';
 import { randomUUID, timingSafeEqual } from 'node:crypto';
 
-const SERVER_NAME = 'lobehub-kie-z-image-mcp';
+const SERVER_NAME = 'lobehub-kie-image-mcp';
 const SERVER_VERSION = '1.0.0';
+
+const MODEL_CONFIG = {
+  'z-image': {
+    title: 'Z-Image',
+    defaultAspectRatio: '1:1',
+    supportsNsfwChecker: true,
+  },
+  'gpt-image-2-text-to-image': {
+    title: 'GPT Image 2',
+    defaultAspectRatio: 'auto',
+    supportsNsfwChecker: false,
+  },
+};
+
+const MODEL_ALIASES = {
+  'z-image': 'z-image',
+  z_image: 'z-image',
+  gpt_image_2: 'gpt-image-2-text-to-image',
+  'gpt-image-2': 'gpt-image-2-text-to-image',
+  'gpt image 2': 'gpt-image-2-text-to-image',
+  'gpt-image-2-text-to-image': 'gpt-image-2-text-to-image',
+};
 
 const PORT = Number.parseInt(process.env.PORT || '3000', 10);
 const KIE_BASE_URL = trimTrailingSlash(process.env.KIE_BASE_URL || 'https://api.kie.ai');
 const KIE_API_KEY = process.env.KIE_API_KEY || '';
 const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN || '';
-const DEFAULT_ASPECT_RATIO = process.env.DEFAULT_ASPECT_RATIO || '1:1';
+const DEFAULT_IMAGE_MODEL = normalizeModel(process.env.DEFAULT_IMAGE_MODEL || 'z-image');
+const DEFAULT_ASPECT_RATIO = process.env.DEFAULT_ASPECT_RATIO || '';
 const DEFAULT_NSFW_CHECKER = parseBoolean(process.env.DEFAULT_NSFW_CHECKER, true);
 const MAX_WAIT_MS = Number.parseInt(process.env.MAX_WAIT_MS || '180000', 10);
 const POLL_INTERVAL_MS = Number.parseInt(process.env.POLL_INTERVAL_MS || '3000', 10);
@@ -26,60 +49,46 @@ const JSON_HEADERS = {
 
 const tools = [
   {
-    name: 'generate_z_image',
-    title: 'Generate Z-Image',
+    name: 'generate_image',
+    title: 'Generate Image',
     description:
-      'Generate an image with KIE Z-Image. By default this creates a task, polls until completion or timeout, and returns the generated image URLs.',
+      'Generate an image with KIE. Choose model z-image or gpt-image-2-text-to-image. If no model is provided, the server default is used.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
-      properties: {
-        prompt: {
-          type: 'string',
-          minLength: 1,
-          description: 'The text prompt describing the image to generate.',
-        },
-        aspect_ratio: {
-          type: 'string',
-          default: DEFAULT_ASPECT_RATIO,
-          description:
-            'Image aspect ratio. Common values include 1:1, 16:9, 9:16, 4:3, 3:4, 3:2, and 2:3.',
-        },
-        nsfw_checker: {
-          type: 'boolean',
-          default: DEFAULT_NSFW_CHECKER,
-          description: 'Whether KIE should run its NSFW checker.',
-        },
-        callBackUrl: {
-          type: 'string',
-          description: 'Optional callback URL passed through to KIE.',
-        },
-        wait_for_result: {
-          type: 'boolean',
-          default: true,
-          description: 'When true, poll KIE until the image is ready or max_wait_seconds is reached.',
-        },
-        max_wait_seconds: {
-          type: 'integer',
-          minimum: 1,
-          maximum: 900,
-          description: 'Override the server polling timeout for this call.',
-        },
-        poll_interval_seconds: {
-          type: 'number',
-          minimum: 1,
-          maximum: 30,
-          description: 'Override the polling interval for this call.',
-        },
-      },
+      properties: createGenerationProperties({ includeModel: true }),
       required: ['prompt'],
     },
   },
   {
-    name: 'get_z_image_task',
-    title: 'Get Z-Image Task',
+    name: 'generate_z_image',
+    title: 'Generate Z-Image',
     description:
-      'Query a KIE task by task ID. Use this when generate_z_image times out before the image is ready.',
+      'Generate an image with KIE Z-Image. Use this when the user explicitly wants Z-Image.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: createGenerationProperties({ fixedModel: 'z-image' }),
+      required: ['prompt'],
+    },
+  },
+  {
+    name: 'generate_gpt_image_2',
+    title: 'Generate GPT Image 2',
+    description:
+      'Generate an image with KIE GPT Image 2 text-to-image. Use this when the user explicitly wants GPT Image 2.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: createGenerationProperties({ fixedModel: 'gpt-image-2-text-to-image' }),
+      required: ['prompt'],
+    },
+  },
+  {
+    name: 'get_image_task',
+    title: 'Get Image Task',
+    description:
+      'Query a KIE image task by task ID. Use this when image generation times out before the image is ready.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -87,7 +96,24 @@ const tools = [
         taskId: {
           type: 'string',
           minLength: 1,
-          description: 'KIE task ID returned by generate_z_image.',
+          description: 'KIE task ID returned by an image generation tool.',
+        },
+      },
+      required: ['taskId'],
+    },
+  },
+  {
+    name: 'get_z_image_task',
+    title: 'Get Image Task Legacy Alias',
+    description: 'Backward-compatible alias for get_image_task.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        taskId: {
+          type: 'string',
+          minLength: 1,
+          description: 'KIE task ID returned by an image generation tool.',
         },
       },
       required: ['taskId'],
@@ -125,6 +151,8 @@ async function routeRequest(req, res) {
       name: SERVER_NAME,
       version: SERVER_VERSION,
       kieConfigured: Boolean(KIE_API_KEY),
+      defaultImageModel: DEFAULT_IMAGE_MODEL,
+      supportedImageModels: Object.keys(MODEL_CONFIG),
     });
     return;
   }
@@ -243,7 +271,7 @@ async function dispatchMethod(method, params) {
           version: SERVER_VERSION,
         },
         instructions:
-          'Use generate_z_image to generate images with KIE Z-Image. Use get_z_image_task to query a task later.',
+          'Use generate_image for configurable KIE image generation, generate_z_image for Z-Image, generate_gpt_image_2 for GPT Image 2, and get_image_task to query a task later.',
       };
 
     case 'notifications/initialized':
@@ -273,35 +301,50 @@ async function callTool(params) {
   const name = params?.name;
   const args = params?.arguments || {};
 
-  if (name === 'generate_z_image') {
-    return asToolResult(await generateZImage(args));
+  if (name === 'generate_image') {
+    return asToolResult(await generateImage(args));
   }
 
-  if (name === 'get_z_image_task') {
-    return asToolResult(await getZImageTask(args));
+  if (name === 'generate_z_image') {
+    return asToolResult(await generateImage(args, 'z-image'));
+  }
+
+  if (name === 'generate_gpt_image_2') {
+    return asToolResult(await generateImage(args, 'gpt-image-2-text-to-image'));
+  }
+
+  if (name === 'get_image_task' || name === 'get_z_image_task') {
+    return asToolResult(await getImageTask(args));
   }
 
   throw new McpError(-32602, `Unknown tool: ${name}`);
 }
 
-async function generateZImage(args) {
+async function generateImage(args, fixedModel) {
   assertKieConfigured();
 
+  const model = fixedModel || normalizeModel(requireOptionalString(args.model, 'model') || DEFAULT_IMAGE_MODEL);
+  const modelConfig = getModelConfig(model);
   const prompt = requireString(args.prompt, 'prompt');
-  const aspectRatio = requireOptionalString(args.aspect_ratio, 'aspect_ratio') || DEFAULT_ASPECT_RATIO;
+  const aspectRatio =
+    requireOptionalString(args.aspect_ratio, 'aspect_ratio') || defaultAspectRatioForModel(model);
   const callbackUrl = requireOptionalString(args.callBackUrl, 'callBackUrl');
-  const nsfwChecker = parseBoolean(args.nsfw_checker, DEFAULT_NSFW_CHECKER);
   const waitForResult = parseBoolean(args.wait_for_result, true);
   const maxWaitMs = secondsToMs(args.max_wait_seconds, MAX_WAIT_MS);
   const pollIntervalMs = secondsToMs(args.poll_interval_seconds, POLL_INTERVAL_MS);
 
+  const input = {
+    prompt,
+    aspect_ratio: aspectRatio,
+  };
+
+  if (modelConfig.supportsNsfwChecker) {
+    input.nsfw_checker = parseBoolean(args.nsfw_checker, DEFAULT_NSFW_CHECKER);
+  }
+
   const payload = {
-    model: 'z-image',
-    input: {
-      prompt,
-      aspect_ratio: aspectRatio,
-      nsfw_checker: nsfwChecker,
-    },
+    model,
+    input,
   };
 
   if (callbackUrl) payload.callBackUrl = callbackUrl;
@@ -318,9 +361,11 @@ async function generateZImage(args) {
 
   if (!waitForResult) {
     return {
+      model,
+      modelTitle: modelConfig.title,
       taskId,
       state: 'submitted',
-      message: 'Task submitted. Call get_z_image_task with this taskId to check progress.',
+      message: 'Task submitted. Call get_image_task with this taskId to check progress.',
       kie: created,
     };
   }
@@ -328,6 +373,8 @@ async function generateZImage(args) {
   const task = await pollTask(taskId, maxWaitMs, pollIntervalMs);
 
   return {
+    model,
+    modelTitle: modelConfig.title,
     taskId,
     state: task.state,
     progress: task.progress,
@@ -340,7 +387,7 @@ async function generateZImage(args) {
   };
 }
 
-async function getZImageTask(args) {
+async function getImageTask(args) {
   assertKieConfigured();
 
   const taskId = requireString(args.taskId, 'taskId');
@@ -443,7 +490,7 @@ function asToolResult(value) {
 
 function taskMessage(task) {
   if (task.timedOut) {
-    return 'The task is still running. Call get_z_image_task later with this taskId.';
+    return 'The task is still running. Call get_image_task later with this taskId.';
   }
 
   if (task.state === 'success') {
@@ -457,6 +504,91 @@ function taskMessage(task) {
   }
 
   return `Task state: ${task.state}`;
+}
+
+function createGenerationProperties({ includeModel = false, fixedModel } = {}) {
+  const properties = {
+    prompt: {
+      type: 'string',
+      minLength: 1,
+      description: 'The text prompt describing the image to generate.',
+    },
+    aspect_ratio: {
+      type: 'string',
+      default: defaultAspectRatioForModel(fixedModel || DEFAULT_IMAGE_MODEL),
+      description:
+        'Image aspect ratio. GPT Image 2 supports auto. Common values include 1:1, 16:9, 9:16, 4:3, 3:4, 3:2, and 2:3.',
+    },
+    nsfw_checker: {
+      type: 'boolean',
+      default: DEFAULT_NSFW_CHECKER,
+      description: 'Whether KIE should run its NSFW checker. This is sent only for Z-Image.',
+    },
+    callBackUrl: {
+      type: 'string',
+      description: 'Optional callback URL passed through to KIE.',
+    },
+    wait_for_result: {
+      type: 'boolean',
+      default: true,
+      description: 'When true, poll KIE until the image is ready or max_wait_seconds is reached.',
+    },
+    max_wait_seconds: {
+      type: 'integer',
+      minimum: 1,
+      maximum: 900,
+      description: 'Override the server polling timeout for this call.',
+    },
+    poll_interval_seconds: {
+      type: 'number',
+      minimum: 1,
+      maximum: 30,
+      description: 'Override the polling interval for this call.',
+    },
+  };
+
+  if (includeModel) {
+    return {
+      model: {
+        type: 'string',
+        enum: Object.keys(MODEL_CONFIG),
+        default: DEFAULT_IMAGE_MODEL,
+        description:
+          'KIE image model to use. Use z-image for Z-Image or gpt-image-2-text-to-image for GPT Image 2.',
+      },
+      ...properties,
+    };
+  }
+
+  return properties;
+}
+
+function defaultAspectRatioForModel(model) {
+  return DEFAULT_ASPECT_RATIO || getModelConfig(model).defaultAspectRatio;
+}
+
+function getModelConfig(model) {
+  const config = MODEL_CONFIG[model];
+  if (!config) {
+    throw new Error(`Unsupported image model: ${model}`);
+  }
+
+  return config;
+}
+
+function normalizeModel(value) {
+  const normalized = String(value || '')
+    .trim()
+    .toLowerCase();
+  const model = MODEL_ALIASES[normalized] || normalized;
+
+  if (!MODEL_CONFIG[model]) {
+    throw new Error(
+      `Unsupported image model: ${value}. Supported models: ${Object.keys(MODEL_CONFIG).join(', ')}`,
+    );
+  }
+
+  return model;
 }
 
 function isPendingState(state) {
