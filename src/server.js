@@ -9,11 +9,13 @@ const MODEL_CONFIG = {
   'z-image': {
     title: 'Z-Image',
     defaultAspectRatio: '1:1',
+    supportsResolution: false,
     supportsNsfwChecker: true,
   },
   'gpt-image-2-text-to-image': {
     title: 'GPT Image 2',
     defaultAspectRatio: 'auto',
+    supportsResolution: true,
     supportsNsfwChecker: false,
   },
 };
@@ -27,16 +29,42 @@ const MODEL_ALIASES = {
   'gpt-image-2-text-to-image': 'gpt-image-2-text-to-image',
 };
 
+const RESOLUTIONS = ['1K', '2K', '4K'];
+const GPT_IMAGE_2_ASPECT_RATIOS = new Set([
+  'auto',
+  '1:1',
+  '3:2',
+  '2:3',
+  '4:3',
+  '3:4',
+  '5:4',
+  '4:5',
+  '16:9',
+  '9:16',
+  '2:1',
+  '1:2',
+  '3:1',
+  '1:3',
+  '21:9',
+  '9:21',
+]);
+
 const PORT = Number.parseInt(process.env.PORT || '3000', 10);
 const KIE_BASE_URL = trimTrailingSlash(process.env.KIE_BASE_URL || 'https://api.kie.ai');
 const KIE_API_KEY = process.env.KIE_API_KEY || '';
 const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN || '';
 const DEFAULT_IMAGE_MODEL = normalizeModel(process.env.DEFAULT_IMAGE_MODEL || 'z-image');
 const DEFAULT_ASPECT_RATIO = process.env.DEFAULT_ASPECT_RATIO || '';
+const DEFAULT_GPT_IMAGE_2_RESOLUTION = normalizeResolution(
+  process.env.DEFAULT_GPT_IMAGE_2_RESOLUTION || '1K',
+);
 const DEFAULT_NSFW_CHECKER = parseBoolean(process.env.DEFAULT_NSFW_CHECKER, true);
-const MAX_WAIT_MS = Number.parseInt(process.env.MAX_WAIT_MS || '180000', 10);
+const DEFAULT_WAIT_FOR_RESULT = parseBoolean(process.env.DEFAULT_WAIT_FOR_RESULT, true);
+const MAX_WAIT_MS = Number.parseInt(process.env.MAX_WAIT_MS || '45000', 10);
 const POLL_INTERVAL_MS = Number.parseInt(process.env.POLL_INTERVAL_MS || '3000', 10);
+const REQUEST_CACHE_TTL_MS = Number.parseInt(process.env.REQUEST_CACHE_TTL_MS || '600000', 10);
 const REQUEST_BODY_LIMIT = 1024 * 1024;
+const generationCache = new Map();
 
 const JSON_HEADERS = {
   'content-type': 'application/json; charset=utf-8',
@@ -152,7 +180,9 @@ async function routeRequest(req, res) {
       version: SERVER_VERSION,
       kieConfigured: Boolean(KIE_API_KEY),
       defaultImageModel: DEFAULT_IMAGE_MODEL,
+      defaultGptImage2Resolution: DEFAULT_GPT_IMAGE_2_RESOLUTION,
       supportedImageModels: Object.keys(MODEL_CONFIG),
+      requestCacheTtlMs: REQUEST_CACHE_TTL_MS,
     });
     return;
   }
@@ -329,14 +359,25 @@ async function generateImage(args, fixedModel) {
   const aspectRatio =
     requireOptionalString(args.aspect_ratio, 'aspect_ratio') || defaultAspectRatioForModel(model);
   const callbackUrl = requireOptionalString(args.callBackUrl, 'callBackUrl');
-  const waitForResult = parseBoolean(args.wait_for_result, true);
+  const waitForResult = parseBoolean(args.wait_for_result, DEFAULT_WAIT_FOR_RESULT);
+  const forceNew = parseBoolean(args.force_new, false);
   const maxWaitMs = secondsToMs(args.max_wait_seconds, MAX_WAIT_MS);
   const pollIntervalMs = secondsToMs(args.poll_interval_seconds, POLL_INTERVAL_MS);
+  const resolution = modelConfig.supportsResolution
+    ? normalizeResolution(
+        requireOptionalString(args.resolution, 'resolution') || DEFAULT_GPT_IMAGE_2_RESOLUTION,
+      )
+    : undefined;
 
   const input = {
     prompt,
     aspect_ratio: aspectRatio,
   };
+
+  if (modelConfig.supportsResolution) {
+    validateGptImage2Settings(aspectRatio, resolution);
+    input.resolution = resolution;
+  }
 
   if (modelConfig.supportsNsfwChecker) {
     input.nsfw_checker = parseBoolean(args.nsfw_checker, DEFAULT_NSFW_CHECKER);
@@ -349,15 +390,12 @@ async function generateImage(args, fixedModel) {
 
   if (callbackUrl) payload.callBackUrl = callbackUrl;
 
-  const created = await kieRequest('/api/v1/jobs/createTask', {
-    method: 'POST',
-    body: JSON.stringify(payload),
+  const cacheKey = createGenerationCacheKey({ model, input, callbackUrl });
+  const { taskId, created, deduplicated } = await getOrCreateGenerationTask({
+    cacheKey,
+    forceNew,
+    payload,
   });
-
-  const taskId = created?.data?.taskId;
-  if (!taskId) {
-    throw new Error(`KIE did not return a taskId: ${JSON.stringify(created)}`);
-  }
 
   if (!waitForResult) {
     return {
@@ -365,7 +403,9 @@ async function generateImage(args, fixedModel) {
       modelTitle: modelConfig.title,
       taskId,
       state: 'submitted',
-      message: 'Task submitted. Call get_image_task with this taskId to check progress.',
+      deduplicated,
+      message:
+        'Task submitted. Call get_image_task with this taskId to check progress. Do not start another generation for the same prompt unless you want to pay for a new task.',
       kie: created,
     };
   }
@@ -382,6 +422,7 @@ async function generateImage(args, fixedModel) {
     failCode: task.failCode,
     failMsg: task.failMsg,
     timedOut: task.timedOut,
+    deduplicated,
     message: taskMessage(task),
     kie: task.raw,
   };
@@ -490,7 +531,7 @@ function asToolResult(value) {
 
 function taskMessage(task) {
   if (task.timedOut) {
-    return 'The task is still running. Call get_image_task later with this taskId.';
+    return 'The task is still running. Call get_image_task later with this taskId. Do not call a generation tool again for the same prompt unless you want a separate paid task.';
   }
 
   if (task.state === 'success') {
@@ -517,7 +558,7 @@ function createGenerationProperties({ includeModel = false, fixedModel } = {}) {
       type: 'string',
       default: defaultAspectRatioForModel(fixedModel || DEFAULT_IMAGE_MODEL),
       description:
-        'Image aspect ratio. GPT Image 2 supports auto. Common values include 1:1, 16:9, 9:16, 4:3, 3:4, 3:2, and 2:3.',
+        'Image aspect ratio. GPT Image 2 supports auto, 1:1, 3:2, 2:3, 4:3, 3:4, 5:4, 4:5, 16:9, 9:16, 2:1, 1:2, 3:1, 1:3, 21:9, and 9:21.',
     },
     nsfw_checker: {
       type: 'boolean',
@@ -545,7 +586,23 @@ function createGenerationProperties({ includeModel = false, fixedModel } = {}) {
       maximum: 30,
       description: 'Override the polling interval for this call.',
     },
+    force_new: {
+      type: 'boolean',
+      default: false,
+      description:
+        'Set true only when the user explicitly wants a new paid generation even if the same prompt and settings were just submitted.',
+    },
   };
+
+  if (includeModel || getModelConfig(fixedModel).supportsResolution) {
+    properties.resolution = {
+      type: 'string',
+      enum: RESOLUTIONS,
+      default: DEFAULT_GPT_IMAGE_2_RESOLUTION,
+      description:
+        'GPT Image 2 output resolution. Optional. Defaults to 1K. Use 2K or 4K only with a concrete aspect ratio, not auto. 4K is not supported with 1:1.',
+    };
+  }
 
   if (includeModel) {
     return {
@@ -574,6 +631,138 @@ function getModelConfig(model) {
   }
 
   return config;
+}
+
+async function getOrCreateGenerationTask({ cacheKey, forceNew, payload }) {
+  cleanupGenerationCache();
+
+  if (!forceNew && REQUEST_CACHE_TTL_MS > 0) {
+    const cached = generationCache.get(cacheKey);
+
+    if (cached?.taskId) {
+      return {
+        taskId: cached.taskId,
+        created: cached.created,
+        deduplicated: true,
+      };
+    }
+
+    if (cached?.createPromise) {
+      const result = await cached.createPromise;
+      return {
+        ...result,
+        deduplicated: true,
+      };
+    }
+  }
+
+  const entry = {
+    createdAt: Date.now(),
+    createPromise: createKieGenerationTask(payload, cacheKey),
+  };
+
+  if (!forceNew && REQUEST_CACHE_TTL_MS > 0) {
+    generationCache.set(cacheKey, entry);
+  }
+
+  try {
+    const result = await entry.createPromise;
+
+    if (!forceNew && REQUEST_CACHE_TTL_MS > 0) {
+      generationCache.set(cacheKey, {
+        createdAt: Date.now(),
+        taskId: result.taskId,
+        created: result.created,
+      });
+    }
+
+    return {
+      ...result,
+      deduplicated: false,
+    };
+  } catch (error) {
+    if (!forceNew) {
+      generationCache.delete(cacheKey);
+    }
+    throw error;
+  }
+}
+
+async function createKieGenerationTask(payload) {
+  const created = await kieRequest('/api/v1/jobs/createTask', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+
+  const taskId = created?.data?.taskId;
+  if (!taskId) {
+    throw new Error(`KIE did not return a taskId: ${JSON.stringify(created)}`);
+  }
+
+  return {
+    taskId,
+    created,
+  };
+}
+
+function cleanupGenerationCache() {
+  if (REQUEST_CACHE_TTL_MS <= 0) return;
+
+  const now = Date.now();
+  for (const [key, entry] of generationCache.entries()) {
+    if (now - entry.createdAt > REQUEST_CACHE_TTL_MS) {
+      generationCache.delete(key);
+    }
+  }
+}
+
+function createGenerationCacheKey(value) {
+  return stableStringify(value);
+}
+
+function validateGptImage2Settings(aspectRatio, resolution) {
+  if (!GPT_IMAGE_2_ASPECT_RATIOS.has(aspectRatio)) {
+    throw new Error(
+      `Unsupported GPT Image 2 aspect_ratio: ${aspectRatio}. Supported values: ${Array.from(
+        GPT_IMAGE_2_ASPECT_RATIOS,
+      ).join(', ')}`,
+    );
+  }
+
+  if (aspectRatio === 'auto' && resolution !== '1K') {
+    throw new Error('GPT Image 2 only supports resolution 1K when aspect_ratio is auto.');
+  }
+
+  if (aspectRatio === '1:1' && resolution === '4K') {
+    throw new Error('GPT Image 2 does not support resolution 4K with aspect_ratio 1:1.');
+  }
+}
+
+function normalizeResolution(value) {
+  const normalized = String(value || '')
+    .trim()
+    .toUpperCase();
+
+  if (!RESOLUTIONS.includes(normalized)) {
+    throw new Error(`Unsupported resolution: ${value}. Supported values: ${RESOLUTIONS.join(', ')}`);
+  }
+
+  return normalized;
+}
+
+function stableStringify(value) {
+  if (value === null || typeof value !== 'object') {
+    return JSON.stringify(value);
+  }
+
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableStringify(item)).join(',')}]`;
+  }
+
+  return `{${Object.keys(value)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`)
+    .join(',')}}`;
 }
 
 function normalizeModel(value) {

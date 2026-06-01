@@ -78,13 +78,23 @@ Optional variables:
 
 ```env
 KIE_BASE_URL=https://api.kie.ai
-DEFAULT_ASPECT_RATIO=1:1
+DEFAULT_ASPECT_RATIO=
+DEFAULT_GPT_IMAGE_2_RESOLUTION=1K
 DEFAULT_NSFW_CHECKER=true
-MAX_WAIT_MS=180000
+DEFAULT_WAIT_FOR_RESULT=true
+MAX_WAIT_MS=45000
 POLL_INTERVAL_MS=3000
+REQUEST_CACHE_TTL_MS=600000
 ```
 
 If `DEFAULT_ASPECT_RATIO` is not set, the server uses `1:1` for Z-Image and `auto` for GPT Image 2.
+
+For GPT Image 2, you do not need to provide resolution or size in normal use:
+
+- default aspect ratio: `auto`
+- default resolution: `1K`
+
+Use `2K` or `4K` only when you explicitly need it.
 
 After deployment, your MCP endpoint is:
 
@@ -107,10 +117,12 @@ It should return something like:
   "version": "1.0.0",
   "kieConfigured": true,
   "defaultImageModel": "z-image",
+  "defaultGptImage2Resolution": "1K",
   "supportedImageModels": [
     "z-image",
     "gpt-image-2-text-to-image"
-  ]
+  ],
+  "requestCacheTtlMs": 600000
 }
 ```
 
@@ -166,7 +178,8 @@ LobeHub should choose `generate_z_image`.
 {
   "model": "gpt-image-2-text-to-image",
   "prompt": "A cinematic night city poster with neon reflections on a rainy street.",
-  "aspect_ratio": "auto"
+  "aspect_ratio": "auto",
+  "resolution": "1K"
 }
 ```
 
@@ -187,6 +200,74 @@ DEFAULT_IMAGE_MODEL=gpt-image-2-text-to-image
 ```
 
 Then normal image-generation requests use GPT Image 2 unless you explicitly ask for Z-Image.
+
+## GPT Image 2 Resolution
+
+GPT Image 2 supports these resolution values:
+
+- `1K`
+- `2K`
+- `4K`
+
+Default behavior in this MCP server:
+
+```json
+{
+  "aspect_ratio": "auto",
+  "resolution": "1K"
+}
+```
+
+Important KIE constraints:
+
+- `auto` aspect ratio only supports `1K`.
+- `2K` or `4K` requires a concrete aspect ratio, such as `16:9`, `9:16`, `4:3`, or `3:4`.
+- `1:1` does not support `4K`.
+
+Examples:
+
+```json
+{
+  "model": "gpt-image-2-text-to-image",
+  "prompt": "A cinematic wide poster with readable title text.",
+  "aspect_ratio": "16:9",
+  "resolution": "2K"
+}
+```
+
+```json
+{
+  "model": "gpt-image-2-text-to-image",
+  "prompt": "A vertical phone wallpaper with a futuristic city.",
+  "aspect_ratio": "9:16",
+  "resolution": "4K"
+}
+```
+
+## Timeout And Duplicate Charge Protection
+
+KIE image generation is asynchronous. A task can keep running even if LobeHub or a gateway times out.
+
+This server reduces accidental duplicate charges in two ways:
+
+- The default polling timeout is `45` seconds. If the image is not ready yet, the tool returns a `taskId` instead of waiting too long.
+- Identical generation requests are cached for `10` minutes by default. If LobeHub retries the same prompt and settings, the server reuses the previous `taskId` instead of creating a new paid KIE task.
+
+If you get a timeout or pending response, do this:
+
+```text
+Check the image task status with taskId task_xxx.
+```
+
+Do not ask LobeHub to generate the same image again unless you want another paid task.
+
+If you really want a new paid variation with the exact same prompt and settings, use:
+
+```json
+{
+  "force_new": true
+}
+```
 
 ## Local Run
 
@@ -217,13 +298,15 @@ http://localhost:3000/mcp
 
 - `prompt` required.
 - `model` optional on `generate_image`: `z-image` or `gpt-image-2-text-to-image`.
-- `aspect_ratio` optional. GPT Image 2 supports `auto`; common values include `1:1`, `16:9`, and `9:16`.
+- `aspect_ratio` optional. GPT Image 2 supports `auto`, `1:1`, `3:2`, `2:3`, `4:3`, `3:4`, `5:4`, `4:5`, `16:9`, `9:16`, `2:1`, `1:2`, `3:1`, `1:3`, `21:9`, and `9:21`.
+- `resolution` optional for GPT Image 2: `1K`, `2K`, or `4K`. Default is `1K`.
 - `nsfw_checker` optional, default `true`, sent only for Z-Image.
 - `wait_for_result` optional, default `true`.
 - `max_wait_seconds` optional per-call timeout.
 - `poll_interval_seconds` optional per-call polling interval.
 - `callBackUrl` optional KIE callback URL.
+- `force_new` optional, default `false`. Set `true` only when you explicitly want a new paid task for the same prompt/settings.
 
-If a call times out while KIE is still generating, the response includes `taskId`. Call `get_image_task` later with that ID.
+If a call times out while KIE is still generating, the response includes `taskId`. Call `get_image_task` later with that ID instead of creating a new generation.
 
 KIE-generated URLs may expire, so save results you want to keep.
