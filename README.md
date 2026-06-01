@@ -7,12 +7,46 @@ It exposes two MCP tools:
 - `generate_z_image`: create a KIE Z-Image task and, by default, wait for image URLs.
 - `get_z_image_task`: query a previously submitted task by `taskId`.
 
-## Deploy On Zeabur
+## 1. Push To GitHub
 
-1. Push this project to GitHub.
-2. In Zeabur, create a service from that GitHub repository.
-3. Use Docker deployment. Zeabur will build the included `Dockerfile`.
-4. Add environment variables:
+Create an empty GitHub repository first. If possible, do not create the GitHub README during repository creation because this local project already has one.
+
+Then run these commands in PowerShell:
+
+```powershell
+cd D:\Scripts\Lobehub
+git init
+git add .
+git commit -m "Add KIE Z-Image MCP server"
+git branch -M main
+git remote add origin https://github.com/your-username/your-repo.git
+git push -u origin main
+```
+
+For this repository, the remote is:
+
+```powershell
+git remote add origin https://github.com/catninelife/lobe_mcp_image_gen.git
+```
+
+If `git push` says `fetch first`, it means GitHub already has an initial commit. Merge it first, then push again:
+
+```powershell
+git fetch origin
+git merge origin/main --allow-unrelated-histories --no-edit
+git push -u origin main
+```
+
+Do not upload `.env`. This project already ignores `.env` in `.gitignore`.
+
+## 2. Deploy On Zeabur
+
+1. Open Zeabur.
+2. Create a new project.
+3. Choose deploy from GitHub.
+4. Select this repository.
+5. Use Docker deployment. Zeabur will build the included `Dockerfile`.
+6. Add these environment variables in Zeabur:
 
 ```env
 KIE_API_KEY=your_kie_api_key
@@ -42,14 +76,28 @@ Health check:
 https://your-zeabur-domain/health
 ```
 
-## Add To LobeHub
+It should return something like:
+
+```json
+{
+  "status": "ok",
+  "name": "lobehub-kie-z-image-mcp",
+  "version": "1.0.0",
+  "kieConfigured": true
+}
+```
+
+If `kieConfigured` is `false`, `KIE_API_KEY` is missing or not applied in Zeabur.
+
+## 3. Add To LobeHub
 
 In LobeHub custom MCP skill settings:
 
 - MCP type: `Streamable HTTP`
 - MCP name: `kie-z-image`
 - Streamable HTTP Endpoint URL: `https://your-zeabur-domain/mcp`
-- Auth type: choose `API Key` if you set `MCP_AUTH_TOKEN`; otherwise choose no auth.
+- Auth type: choose `API Key`.
+- API Key: use the same value as Zeabur `MCP_AUTH_TOKEN`.
 - Skill description: `Generate images with KIE Z-Image instead of Google Nano Banana.`
 - Skill avatar: optional.
 
@@ -58,6 +106,14 @@ If LobeHub's API Key mode does not send a bearer token, add an advanced HTTP hea
 ```text
 x-api-key: your_private_lobehub_token
 ```
+
+Then click the LobeHub connection test button.
+
+Common errors:
+
+- `401`: the API key is wrong or not being sent. Use the `x-api-key` header above.
+- `404`: the endpoint URL is wrong. It must end with `/mcp`.
+- `kieConfigured:false` on `/health`: Zeabur does not have `KIE_API_KEY` configured.
 
 ## Local Run
 
