@@ -1,0 +1,14 @@
+{
+  "name": "lobehub-kie-z-image-mcp",
+  "version": "1.0.0",
+  "description": "A Docker-ready Streamable HTTP MCP server for KIE Z-Image in LobeHub.",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "check": "node --check src/server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}
